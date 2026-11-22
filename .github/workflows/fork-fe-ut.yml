@@ -1,0 +1,51 @@
+# Fork-only workflow: builds the FE and runs the unit tests listed in .fork-ci/tests.
+# Lives on ci/** branches of the fork, never on branches sent upstream.
+name: fork-fe-ut
+
+on:
+  push:
+    branches: ['ci/**']
+
+concurrency:
+  group: fork-fe-ut-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fe-ut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: fe-m2-${{ hashFiles('fe/**/pom.xml') }}
+          restore-keys: fe-m2-
+
+      - name: Run FE unit tests
+        run: |
+          mkdir -p "$HOME/.m2"
+          docker run --rm \
+            -v "$PWD":/workspace -v "$HOME/.m2":/root/.m2 -w /workspace \
+            "$(cat .fork-ci/image)" \
+            bash -lc 'git config --global --add safe.directory /workspace && ./run-fe-ut.sh -j 2 --test "$(cat .fork-ci/tests)"'
+
+      - name: Fix ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD" "$HOME/.m2"
+
+      - name: Upload surefire reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: |
+            fe/**/target/surefire-reports/*.txt
+            fe/**/target/surefire-reports/*.dumpstream
+          retention-days: 3
