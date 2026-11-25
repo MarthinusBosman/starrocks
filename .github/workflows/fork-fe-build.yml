@@ -1,0 +1,105 @@
+# Fork-only workflow: builds the FE of a build/** branch and publishes it as a workflow artifact.
+# With "release" in .fork-ci/release it also creates a GitHub release and patched images on ghcr.io.
+name: fork-fe-build
+
+on:
+  push:
+    branches: ['build/**']
+
+concurrency:
+  group: fork-fe-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  fe-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: fe-m2-build-${{ hashFiles('fe/**/pom.xml') }}
+          restore-keys: fe-m2-build-
+
+      - name: Read build settings
+        id: cfg
+        run: |
+          echo "base=$(sed -n 1p .fork-ci/release)" >> "$GITHUB_OUTPUT"
+          echo "tag=$(sed -n 2p .fork-ci/release)" >> "$GITHUB_OUTPUT"
+          echo "publish=$(sed -n 3p .fork-ci/release)" >> "$GITHUB_OUTPUT"
+
+      - name: Build FE
+        run: |
+          mkdir -p "$HOME/.m2"
+          docker run --rm \
+            -e STARROCKS_VERSION="${{ steps.cfg.outputs.base }}"             -e STARROCKS_COMMIT_HASH="$(sed -n 4p .fork-ci/release | cut -c1-7)" \
+            -v "$PWD":/workspace -v "$HOME/.m2":/root/.m2 -w /workspace \
+            "$(cat .fork-ci/image)" \
+            bash -lc 'git config --global --add safe.directory /workspace && ./build.sh --fe 2>&1 | tee build.log; exit ${PIPESTATUS[0]}'
+
+      - name: Fix ownership
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "$PWD" "$HOME/.m2"
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp output/fe/lib/fe-core-*.jar output/fe/lib/fe-parser-*.jar output/fe/lib/fe-grammar-*.jar dist/
+          tar -C dist -czf "starrocks-fe-patched-jars-${{ steps.cfg.outputs.tag }}.tar.gz" .
+          tar -C output -czf "starrocks-fe-${{ steps.cfg.outputs.tag }}.tar.gz" fe
+          sha256sum starrocks-fe-*.tar.gz | tee SHA256SUMS
+          ls -la *.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fe-patched-jars
+          path: |
+            starrocks-fe-patched-jars-*.tar.gz
+            SHA256SUMS
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 3
+
+      - name: Publish images
+        if: steps.cfg.outputs.publish == 'release'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          base="${{ steps.cfg.outputs.base }}"
+          tag="${{ steps.cfg.outputs.tag }}"
+          mkdir imgctx && cp dist/*.jar imgctx/
+          build() {  # image, lib dir inside the image, owner
+            printf 'FROM docker.io/starrocks/%s:%s\nCOPY --chown=%s . %s/\n' "$1" "$base" "$3" "$2" > Dockerfile.fork
+            docker build -f Dockerfile.fork -t "ghcr.io/$owner/starrocks/$1:$tag" imgctx
+            # the image must hold exactly the patched jars
+            docker run --rm --entrypoint sh "ghcr.io/$owner/starrocks/$1:$tag" -c "cd $2 && sha256sum fe-core-*.jar fe-parser-*.jar fe-grammar-*.jar" > in-image.sums
+            (cd imgctx && sha256sum fe-core-*.jar fe-parser-*.jar fe-grammar-*.jar) | diff - in-image.sums
+            docker push "ghcr.io/$owner/starrocks/$1:$tag"
+          }
+          build fe-ubuntu /opt/starrocks/fe/lib 1000:1000
+          build allin1-ubuntu /data/deploy/starrocks/fe/lib 0:0
+
+      - name: Publish release
+        if: steps.cfg.outputs.publish == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.cfg.outputs.tag }}" --target "$(sed -n 4p .fork-ci/release)" \
+            --title "${{ steps.cfg.outputs.tag }}" --notes-file .fork-ci/release-notes.md \
+            starrocks-fe-*.tar.gz SHA256SUMS
